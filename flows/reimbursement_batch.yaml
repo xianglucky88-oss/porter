@@ -1,0 +1,41 @@
+name: reimbursement_batch
+description: 差旅费用报销批量录入（每人每月一次）
+dataset: reimbursement
+
+steps:
+  - kind: open
+    value: /form/reimbursement
+
+  - kind: fill
+    selector: input#source_key
+    value: EXP-{date}-0042
+
+  - kind: fill
+    selector: input#applicant
+    value: 李娜
+
+  - kind: fill
+    selector: input#expense_type
+    value: 差旅费
+
+  - kind: fill
+    selector: input#amount_cents
+    value: "348600"
+
+  - kind: fill
+    selector: input#invoice_no
+    value: INV-20261108-7781
+
+  - kind: fill
+    selector: input#remark
+    value: 华东区客户拜访
+
+  - kind: click
+    selector: button#submit-btn
+
+  - kind: submit
+    value: ""
+
+  - kind: assert_text
+    selector: p#receipt-id
+    value: ""

@@ -1,0 +1,44 @@
+name: purchase_requisition
+description: 采购申请单批量录入（月度集采，约 40 条/批）
+dataset: purchase_requisition
+
+# 说明：这个流程按单条单据执行一次。批量由上层脚本循环调用 /flows/.../run。
+
+steps:
+  - kind: open
+    value: /form/purchase_requisition
+
+  - kind: fill
+    selector: input#source_key
+    value: PO-202611-0001
+
+  - kind: fill
+    selector: input#applicant
+    value: 张伟
+
+  - kind: fill
+    selector: input#department
+    value: 采购一科
+
+  - kind: fill
+    selector: input#supplier_code
+    value: SUP-00042
+
+  - kind: fill
+    selector: input#amount_cents
+    value: "1289000"
+
+  - kind: fill
+    selector: input#budget_code
+    value: BUD-2026-Q4-07
+    optional: true
+
+  - kind: click
+    selector: button#submit-btn
+
+  - kind: submit
+    value: ""
+
+  - kind: assert_text
+    selector: p#receipt-id
+    value: ""
