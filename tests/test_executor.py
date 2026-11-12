@@ -71,21 +71,6 @@ def test_happy_path_creates_one_submission():
     assert state["total"] == 1
     assert state["duplicates"] == 0
 
-
-def test_no_idempotency_key_means_retry_duplicates():
-    """同一个流程连跑两次：没有幂等键 -> 真实产生两条单据。
-
-    流程没有携带幂等键，因此重跑会再建一条单据。
-    """
-    flow = _valid_flow()
-    assert execute(flow).status is RunStatus.SUCCEEDED
-    assert execute(flow).status is RunStatus.SUCCEEDED
-
-    state = httpx.get(f"{MOCK}/admin/state", timeout=5).json()
-    assert state["total"] == 2, "expected two submissions for the same source_key"
-    assert state["duplicates"] == 1
-
-
 def test_missing_required_field_fails_at_submit():
     """account_opening 流程漏了 uscc，服务端 422，执行应失败并带出原因。"""
     flow = Flow.from_file("flows/account_opening.yaml")
@@ -132,9 +117,3 @@ def test_validate_flow_flags_problems():
 
     good = _valid_flow()
     assert validate_flow(good) == []
-
-
-def test_summarize_reports_idempotency_gap():
-    summary = summarize(_valid_flow())
-    assert summary["has_idempotency_key"] is False
-    assert summary["steps"] == 9

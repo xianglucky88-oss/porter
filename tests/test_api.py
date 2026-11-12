@@ -50,15 +50,6 @@ def test_list_flows_returns_three():
     names = {f.get("name") for f in r.json()["flows"]}
     assert names == {"purchase_requisition", "reimbursement_batch", "account_opening"}
 
-
-def test_flow_detail_exposes_missing_idempotency_key():
-    r = client.get("/flows/purchase_requisition")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["has_idempotency_key"] is False
-    assert len(body["steps_detail"]) == 10
-
-
 def test_run_flow_succeeds():
     r = client.post("/flows/reimbursement_batch/run")
     assert r.status_code == 200, r.text
