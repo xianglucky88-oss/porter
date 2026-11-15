@@ -21,6 +21,10 @@ class Settings:
     )
     mockapp_url: str = field(default_factory=lambda: _env("MOCKAPP_URL", "http://localhost:9200"))
     flows_dir: str = field(default_factory=lambda: _env("FLOWS_DIR", "flows"))
+    # 受治理流程定义的版本仓库。运行记录与审计都以此为事实来源。
+    definitions_path: str = field(
+        default_factory=lambda: _env("DEFINITIONS_PATH", "data/definitions.json")
+    )
     headless: bool = field(default_factory=lambda: _env("HEADLESS", "1") == "1")
     # 提交后等待跳转的最长秒数。超时会被当成失败并触发重试。
     submit_timeout: float = field(default_factory=lambda: float(_env("SUBMIT_TIMEOUT", "8")))

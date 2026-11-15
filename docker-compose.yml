@@ -39,6 +39,9 @@ services:
       MOCKAPP_URL: http://mockapp:9200
       USE_BROWSER: "0"
       HEADLESS: "1"
+      # 受治理的定义版本与审计日志。落盘到命名卷，容器重建不丢失发布历史。
+      DEFINITIONS_PATH: /app/data/definitions.json
+      FLOWS_DIR: /app/flows
     ports: ["9201:9201"]
     depends_on:
       db:
@@ -47,6 +50,8 @@ services:
         condition: service_healthy
     volumes:
       - ./flows:/app/flows:ro
+      - porter-definitions:/app/data
 
 volumes:
   pgdata:
+  porter-definitions:

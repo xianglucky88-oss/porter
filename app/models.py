@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -56,16 +56,22 @@ class Flow:
     dataset: str | None = None
 
     @classmethod
-    def from_yaml(cls, text: str) -> "Flow":
-        raw = yaml.safe_load(text)
+    def from_dict(cls, raw: dict[str, Any]) -> "Flow":
         if not isinstance(raw, dict) or "steps" not in raw:
-            raise ValueError("flow yaml must contain a 'steps' list")
+            raise ValueError("flow definition must contain a 'steps' list")
         return cls(
             name=raw["name"],
             description=raw.get("description", ""),
             steps=[Step.from_dict(s) for s in raw["steps"]],
             dataset=raw.get("dataset"),
         )
+
+    @classmethod
+    def from_yaml(cls, text: str) -> "Flow":
+        raw = yaml.safe_load(text)
+        if not isinstance(raw, dict) or "steps" not in raw:
+            raise ValueError("flow yaml must contain a 'steps' list")
+        return cls.from_dict(raw)
 
     @classmethod
     def from_file(cls, path: str) -> "Flow":
@@ -89,22 +95,39 @@ class Run:
     status: RunStatus
     started_at: datetime
     finished_at: datetime | None = None
-    # 运行记录只有状态与时间字段，没有步骤级快照。
     error: str | None = None
     attempts: int = 0
     # 提交成功后目标系统返回的回执号，用于关联 submissions 表。
     receipt_id: str | None = None
+    # 启动时确认的定义版本。新旧定义并存时，重试/恢复必须沿用这一版。
+    flow_version: int | None = None
+    flow_content_hash: str | None = None
+    # 执行期错误与定义发布问题的区分依据。
+    failure_kind: str | None = None
+    # 失败步骤的序号与类型（0 起），用于把异常定位到版本内的具体步骤。
+    failed_step: int | None = None
+    failed_step_kind: str | None = None
+    # run_id 由调用方提供时用于幂等重试；相同 run_id 不会重复执行。
+    resumed_from: str | None = None
+    batch_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "flow": self.flow,
+            "flow_version": self.flow_version,
+            "flow_content_hash": self.flow_content_hash,
             "status": self.status.value,
             "started_at": self.started_at.isoformat(),
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "error": self.error,
+            "failure_kind": self.failure_kind,
+            "failed_step": self.failed_step,
+            "failed_step_kind": self.failed_step_kind,
             "attempts": self.attempts,
             "receipt_id": self.receipt_id,
+            "resumed_from": self.resumed_from,
+            "batch_id": self.batch_id,
         }
 
 

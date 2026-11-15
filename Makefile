@@ -9,6 +9,7 @@ help:
 	@echo "make up        启动 db / mockapp / runner"
 	@echo "make down      停止并清理"
 	@echo "make demo      固定演示序列（90 秒内可录完）"
+	@echo "make govern-demo  定义生命周期演示（草稿→发布→废弃→回退→版本绑定）"
 	@echo "make verify    一致性断言脚本"
 	@echo "make test      单测（需要 mockapp 在 9200）"
 	@echo "make lint      ruff + mypy（如已安装）"
@@ -31,6 +32,10 @@ logs:
 .PHONY: demo
 demo:
 	@sh scripts/demo.sh
+
+.PHONY: govern-demo
+govern-demo:
+	@sh scripts/governance_demo.sh
 
 .PHONY: verify
 verify:

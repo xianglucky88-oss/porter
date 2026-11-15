@@ -160,33 +160,71 @@ def make_driver() -> Driver:
 
 
 def validate_flow(flow: Flow) -> list[str]:
-    """静态校验：步骤顺序、必填字段是否齐全。返回问题列表（空表示通过）。"""
-    problems: list[str] = []
-    kinds = [s.kind for s in flow.steps]
-    if StepKind.OPEN not in kinds:
-        problems.append("flow has no 'open' step")
-    if StepKind.SUBMIT not in kinds:
-        problems.append("flow has no 'submit' step")
-    if kinds and kinds[0] != StepKind.OPEN:
-        problems.append("first step should be 'open'")
-    if kinds and kinds[-1] not in (StepKind.SUBMIT, StepKind.ASSERT_TEXT, StepKind.WAIT):
-        problems.append("last step should be 'submit' or an assertion")
-    if kinds.count(StepKind.SUBMIT) > 1:
-        problems.append("flow has more than one 'submit' step")
-    return problems
+    """轻量静态校验（历史接口）。
+
+    发布门禁以 `governance.review_definition` 为准；这里把同一套审查的错误项
+    映射成历史调用方使用的英文短语，避免两套规则各自演化。
+    """
+    from .governance import DEFAULT_DATASETS, review_definition
+
+    raw = {
+        "name": flow.name,
+        "description": flow.description,
+        "dataset": flow.dataset,
+        "steps": [
+            {
+                "kind": s.kind.value,
+                "selector": s.selector,
+                "value": s.value,
+                "text": s.text,
+                "idempotency_key": s.idempotency_key,
+                "optional": s.optional,
+            }
+            for s in flow.steps
+        ],
+    }
+    legacy = {
+        "missing_open": "flow has no 'open' step",
+        "missing_submit": "flow has no 'submit' step",
+        "first_step_not_open": "first step should be 'open'",
+        "bad_last_step": "last step should be 'submit' or an assertion",
+        "multiple_submit": "flow has more than one 'submit' step",
+        "assert_before_submit": "assertion appears before 'submit'",
+    }
+    return [
+        legacy.get(f.code, f.message)
+        for f in review_definition(raw, DEFAULT_DATASETS).errors
+    ]
 
 
-def execute(flow: Flow, driver: Driver | None = None) -> Run:
+def execute(
+    flow: Flow,
+    driver: Driver | None = None,
+    *,
+    run_id: str | None = None,
+    flow_version: int | None = None,
+    flow_content_hash: str | None = None,
+    attempts: int = 1,
+    resumed_from: str | None = None,
+    batch_id: str | None = None,
+) -> Run:
     """执行一个流程。
 
     返回 Run。异常不外抛，全部收敛进 Run.error —— 调用方（API）只需要看状态。
+
+    `flow_version` / `flow_content_hash` 是启动时确认的绑定，执行过程中不再回读
+    定义仓库：重试与恢复因此不会静默切换到新版本。
     """
     run = Run(
-        run_id=uuid.uuid4().hex[:16],
+        run_id=run_id or uuid.uuid4().hex[:16],
         flow=flow.name,
         status=RunStatus.RUNNING,
         started_at=utcnow(),
-        attempts=1,
+        attempts=attempts,
+        flow_version=flow_version,
+        flow_content_hash=flow_content_hash,
+        resumed_from=resumed_from,
+        batch_id=batch_id,
     )
     own_driver = driver is None
     drv = driver or make_driver()
@@ -207,6 +245,11 @@ def execute(flow: Flow, driver: Driver | None = None) -> Run:
     except Exception as exc:  # noqa: BLE001 - 全部收敛
         run.status = RunStatus.FAILED
         run.error = str(exc)
+        run.failure_kind = classify_failure(exc)
+        failed = exc if isinstance(exc, DriverError) else exc.__cause__
+        if isinstance(failed, DriverError):
+            run.failed_step = failed.step_index
+            run.failed_step_kind = failed.step.kind.value
     finally:
         if own_driver:
             try:
@@ -215,6 +258,35 @@ def execute(flow: Flow, driver: Driver | None = None) -> Run:
                 pass
         run.finished_at = utcnow()
     return run
+
+
+def classify_failure(exc: BaseException) -> str:
+    """把失败分成"定义问题"与"执行期问题"，供运维判断。
+
+    - definition：步骤定位不到、字段与数据集 schema 不符、流程结构不成立；
+    - runtime：目标系统 5xx、超时、网络错误等；
+    - unknown：其余。
+    """
+    from .governance import GovernanceError  # 避免循环导入
+
+    if isinstance(exc, GovernanceError):
+        return "definition"
+    text = str(exc).lower()
+    definition_markers = (
+        "validation failed",
+        "422",
+        "required",
+        "missing required",
+        "open needs a url",
+        "unknown step kind",
+        "no such receipt",
+    )
+    runtime_markers = ("timeout", "timed out", "connection", "502", "503", "504", "gateway", "500")
+    if any(marker in text for marker in definition_markers):
+        return "definition"
+    if any(marker in text for marker in runtime_markers):
+        return "runtime"
+    return "unknown"
 
 
 class StepFailure(RuntimeError):
