@@ -1,0 +1,36 @@
+# .dockerignore —— 尽量让构建上下文小且不含本地敏感状态。
+# 运行数据、浏览器 profile、产物、虚拟环境都不应进入镜像。
+.git
+.github
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.env
+.env.*
+!.env.example
+secrets/
+credentials*
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+runtime/
+artifacts/
+traces/
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+.pgdata
+tmp/
+docs/
+tests/

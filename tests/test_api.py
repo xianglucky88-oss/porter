@@ -59,10 +59,35 @@ def test_run_flow_succeeds():
 
 
 def test_run_account_opening_fails_with_422():
+    """目标系统明确拒绝 -> HTTP 422，且归因为 business，不是环境故障。"""
     r = client.post("/flows/account_opening/run")
-    assert r.status_code == 502
-    assert r.json()["status"] == "failed"
+    assert r.status_code == 422
+    body = r.json()
+    assert body["status"] == "failed"
+    assert body["failure_class"] == "business"
+    assert body["business_failure"] is True
+    assert body["retryable"] is False
     assert "422" in r.json()["error"] or "required" in r.json()["error"].lower()
+    assert r.headers["X-Porter-Driver"] == "http"
+
+
+def test_environment_failure_is_not_reported_as_business():
+    """目标系统不可达时必须归为 environment，绝不能算成业务表单失败。"""
+    from app.config import settings
+
+    original = settings.mockapp_url
+    settings.mockapp_url = "http://127.0.0.1:1"  # 关掉的端口
+    try:
+        r = client.post("/flows/reimbursement_batch/run")
+    finally:
+        settings.mockapp_url = original
+
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "failed"
+    assert body["failure_class"] == "environment"
+    assert body["business_failure"] is False
+    assert body["evidence"].get("submit_may_have_landed") is not True
 
 
 def test_unknown_flow_404():

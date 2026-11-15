@@ -4,10 +4,23 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
+  # 快速路径：HTTP 驱动。不需要浏览器，几十秒内给出归因/配额/驱动语义的结论。
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: porter
+          POSTGRES_PASSWORD: porter
+          POSTGRES_DB: porter
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U porter -d porter"
+          --health-interval 2s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,6 +30,10 @@ jobs:
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt
+      - name: lint
+        run: |
+          pip install ruff
+          ruff check app mockapp tests scripts
       - name: start mockapp
         run: |
           nohup python -m uvicorn mockapp.main:app --port 9200 > mockapp.log 2>&1 &
@@ -25,6 +42,70 @@ jobs:
         env:
           MOCKAPP_URL: http://localhost:9200
         run: python -m pytest -q
+      - name: start runner
+        env:
+          DATABASE_URL: postgresql://porter:porter@localhost:5432/porter
+        run: |
+          nohup python -m uvicorn app.api:app --port 9201 > runner.log 2>&1 &
+          sh scripts/wait_for.sh http://localhost:9201/readyz 60
+      - name: verify (http)
+        env:
+          MOCKAPP_URL: http://localhost:9200
+        # 已知缺口（幂等键未实现）会以 KNOWN 显式列出但不阻塞构建；
+        # 归因/健康/落库类回归仍会导致失败。
+        run: |
+          python scripts/verify_rpa.py --base http://localhost:9201 \
+            --mock http://localhost:9200 --expect-driver http
       - name: mockapp logs
         if: always()
         run: cat mockapp.log
+      - name: runner logs
+        if: always()
+        run: cat runner.log
+
+  # 浏览器路径：只在 main 与手动触发时跑。
+  # 用真实镜像，验证 Chromium/字体/沙箱/shm 组合以及 /readyz 的浏览器探测。
+  browser:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: build images
+        run: |
+          docker build --target app -t porter:http \
+            --build-arg PORTER_BUILD=${GITHUB_SHA::8} .
+          docker build --target browser -t porter:browser \
+            --build-arg PORTER_BUILD=${GITHUB_SHA::8} \
+            --build-arg PLAYWRIGHT_VERSION=1.49.1 .
+      - name: up
+        run: docker compose --profile browser up -d db mockapp runner-browser
+      - name: wait for browser readiness (real launch probe)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:9202/readyz > /tmp/ready.json 2>/dev/null; then
+              cat /tmp/ready.json; exit 0
+            fi
+            sleep 3
+          done
+          echo "not ready:"; cat /tmp/ready.json || true
+          docker compose --profile browser logs --tail=200 runner-browser
+          exit 1
+      - name: driver health
+        run: curl -fsS http://localhost:9202/health/driver | tee /tmp/driver.json
+      - name: verify (browser)
+        run: |
+          python3 scripts/verify_rpa.py \
+            --base http://localhost:9202 --mock http://localhost:9200 \
+            --expect-driver browser
+      - name: image must ship CJK fonts
+        # 浏览器镜像必须自带中文字体，否则断言会在渲染层随机失败。
+        run: |
+          docker compose --profile browser exec -T runner-browser \
+            python -c "from app.browser_runtime import font_count; n=font_count(); print('fonts', n); raise SystemExit(0 if n > 0 else 1)"
+      - name: logs
+        if: always()
+        run: docker compose --profile browser logs --tail=300
+      - name: down
+        if: always()
+        run: docker compose --profile browser down -v --remove-orphans

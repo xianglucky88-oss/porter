@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime
 from typing import Any
 
 import psycopg
+import psycopg.types.json
 from psycopg.rows import dict_row
 
 from .config import settings
@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS submissions_source_idx ON submissions (source_key);
 """
 
+# 增量迁移：把失败归因与驱动信息落库，让"环境故障 vs 业务失败"可查询。
+# 用 ADD COLUMN IF NOT EXISTS，老库可直接升级。
+MIGRATIONS = """
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS driver TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS degraded BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS degraded_reason TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS failure_class TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS failure_code TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS failed_step INTEGER;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS evidence JSONB;
+CREATE INDEX IF NOT EXISTS runs_failure_class_idx ON runs (failure_class, started_at DESC);
+"""
+
 
 class Store:
     """薄封装。生产环境会换成连接池，这里保持简单。"""
@@ -73,17 +86,27 @@ class Store:
     def migrate(self) -> None:
         with self._conn() as conn:
             conn.execute(DDL)
+            conn.execute(MIGRATIONS)
 
     def save_run(self, run: Run, source_key: str = "", receipt_id: str | None = None) -> None:
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO runs (run_id, flow, status, started_at, finished_at, error, attempts)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """INSERT INTO runs (run_id, flow, status, started_at, finished_at, error, attempts,
+                                     driver, degraded, degraded_reason, failure_class, failure_code,
+                                     failed_step, evidence)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (run_id) DO UPDATE
                      SET status = EXCLUDED.status,
                          finished_at = EXCLUDED.finished_at,
                          error = EXCLUDED.error,
-                         attempts = EXCLUDED.attempts""",
+                         attempts = EXCLUDED.attempts,
+                         driver = EXCLUDED.driver,
+                         degraded = EXCLUDED.degraded,
+                         degraded_reason = EXCLUDED.degraded_reason,
+                         failure_class = EXCLUDED.failure_class,
+                         failure_code = EXCLUDED.failure_code,
+                         failed_step = EXCLUDED.failed_step,
+                         evidence = EXCLUDED.evidence""",
                 (
                     run.run_id,
                     run.flow,
@@ -92,6 +115,13 @@ class Store:
                     run.finished_at,
                     run.error,
                     run.attempts,
+                    run.driver,
+                    run.degraded,
+                    run.degraded_reason,
+                    run.failure_class,
+                    run.failure_code,
+                    run.failed_step,
+                    psycopg.types.json.Jsonb(run.evidence or {}),
                 ),
             )
             if run.status.value == "succeeded" and receipt_id:
@@ -121,6 +151,23 @@ class Store:
                     "SELECT status, count(*) AS n FROM runs GROUP BY status"
                 ).fetchall()
             }
+            # 失败按归因拆分：业务失败与运行环境失败必须分开统计。
+            by_failure_class = {
+                (row["failure_class"] or "none"): row["n"]
+                for row in conn.execute(
+                    """SELECT failure_class, count(*) AS n FROM runs
+                       WHERE status = 'failed' GROUP BY failure_class"""
+                ).fetchall()
+            }
+            by_driver = {
+                (row["driver"] or "unknown"): row["n"]
+                for row in conn.execute(
+                    "SELECT driver, count(*) AS n FROM runs GROUP BY driver"
+                ).fetchall()
+            }
+            degraded = conn.execute(
+                "SELECT count(*) AS n FROM runs WHERE degraded"
+            ).fetchone()["n"]
             by_flow = {
                 row["flow"]: row["n"]
                 for row in conn.execute(
@@ -133,8 +180,16 @@ class Store:
                    ) t"""
             ).fetchone()["n"]
             total = conn.execute("SELECT count(*) AS n FROM submissions").fetchone()["n"]
+        business = by_failure_class.get("business", 0)
+        non_business = sum(n for k, n in by_failure_class.items() if k != "business")
         return {
             "runs_by_status": by_status,
+            "runs_by_failure_class": by_failure_class,
+            "runs_by_driver": by_driver,
+            "degraded_runs": degraded,
+            # 业务失败率只统计 business，环境故障单独给出，避免混在一起看。
+            "business_failures": business,
+            "non_business_failures": non_business,
             "submissions_by_flow": by_flow,
             "submissions_total": total,
             "duplicate_source_keys": dup_sources,

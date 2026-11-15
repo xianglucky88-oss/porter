@@ -4,6 +4,8 @@ pydantic==2.10.4
 PyYAML==6.0.2
 psycopg[binary]==3.2.3
 httpx==0.28.1
+# mockapp 的 HTML 表单端点（浏览器路径的目标站点）需要 Form 解析
+python-multipart==0.0.20
 playwright==1.49.1
 
 # 测试

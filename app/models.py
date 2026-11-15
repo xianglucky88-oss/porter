@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -34,7 +34,7 @@ class Step:
     optional: bool = False
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "Step":
+    def from_dict(cls, raw: dict[str, Any]) -> Step:
         kind = StepKind(raw["kind"])
         return cls(
             kind=kind,
@@ -56,7 +56,7 @@ class Flow:
     dataset: str | None = None
 
     @classmethod
-    def from_yaml(cls, text: str) -> "Flow":
+    def from_yaml(cls, text: str) -> Flow:
         raw = yaml.safe_load(text)
         if not isinstance(raw, dict) or "steps" not in raw:
             raise ValueError("flow yaml must contain a 'steps' list")
@@ -68,7 +68,7 @@ class Flow:
         )
 
     @classmethod
-    def from_file(cls, path: str) -> "Flow":
+    def from_file(cls, path: str) -> Flow:
         with open(path, "r", encoding="utf-8") as fh:
             return cls.from_yaml(fh.read())
 
@@ -82,18 +82,40 @@ class RunStatus(str, Enum):
 
 @dataclass
 class Run:
-    """一次流程执行记录。"""
+    """一次流程执行记录。
+
+    `failure_class` 是排障与告警的分界线：
+      * business   —— 目标系统拒绝，改数据后重跑；
+      * flow       —— 流程与页面不匹配，改流程；
+      * environment/transient/internal —— 运维问题，不应计入业务失败率。
+    字符串 `error` 只用于人读，不能用于自动判定。
+    """
 
     run_id: str
     flow: str
     status: RunStatus
     started_at: datetime
     finished_at: datetime | None = None
-    # 运行记录只有状态与时间字段，没有步骤级快照。
     error: str | None = None
     attempts: int = 0
     # 提交成功后目标系统返回的回执号，用于关联 submissions 表。
     receipt_id: str | None = None
+    # 实际使用的驱动：http / browser。
+    driver: str = "http"
+    # 本次运行是否走了降级路径（如浏览器不可用后改用 HTTP）。
+    degraded: bool = False
+    degraded_reason: str | None = None
+    failure_class: str | None = None
+    failure_code: str | None = None
+    failed_step: int | None = None
+    # 失败证据（已脱敏）。只放定位环境问题所需的字段。
+    evidence: dict[str, Any] = field(default_factory=dict)
+    # 失败时内核给出的重试建议；仅当失败发生在提交前才可能为真。
+    retryable: bool = False
+
+    @property
+    def is_business_failure(self) -> bool:
+        return self.failure_class == "business"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,8 +127,18 @@ class Run:
             "error": self.error,
             "attempts": self.attempts,
             "receipt_id": self.receipt_id,
+            "driver": self.driver,
+            "degraded": self.degraded,
+            "degraded_reason": self.degraded_reason,
+            "failure_class": self.failure_class,
+            "failure_code": self.failure_code,
+            "failed_step": self.failed_step,
+            "evidence": self.evidence,
+            "retryable": self.retryable,
+            # 供上游脚本直接判断，无需解析字符串。
+            "business_failure": self.is_business_failure,
         }
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)

@@ -1,3 +1,21 @@
+# 两种运行形态，边界明确：
+#
+#   docker compose up -d                      HTTP 路径（默认）：CI、离线演示、受限容器
+#   docker compose --profile browser up -d    浏览器路径：真实页面渲染与表单提交
+#
+# 两者共用 db 与 mockapp，但 runner 是独立服务（runner / runner-browser），
+# 因此可以用同一份流程对比两种驱动的行为，互不影响。
+#
+# 浏览器服务的关键资源约束：
+#   shm_size: 1gb        —— Chromium 默认需要较大的 /dev/shm，64MB 会白屏/SIGBUS
+#   init: true           —— 及时回收崩溃后残留的 Chromium 子进程
+#   read_only + tmpfs    —— 根文件系统只读，运行数据落 tmpfs，不污染镜像
+#   pids_limit           —— 防止僵尸/失控进程耗尽宿主机 PID
+#   BROWSER_MAX_SESSIONS —— 单容器并发会话上限，超出排队而非无限起浏览器
+
+x-db-env: &db-env
+  DATABASE_URL: postgresql://porter:porter@db:5432/porter
+
 services:
   db:
     image: postgres:16-alpine
@@ -33,12 +51,16 @@ services:
       context: .
       dockerfile: Dockerfile
       target: app
+      args:
+        PORTER_BUILD: ${PORTER_BUILD:-dev}
     command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "9201"]
     environment:
-      DATABASE_URL: postgresql://porter:porter@db:5432/porter
+      <<: *db-env
       MOCKAPP_URL: http://mockapp:9200
       USE_BROWSER: "0"
       HEADLESS: "1"
+      BROWSER_FALLBACK: "off"
+      PORTER_BUILD: ${PORTER_BUILD:-dev}
     ports: ["9201:9201"]
     depends_on:
       db:
@@ -47,6 +69,67 @@ services:
         condition: service_healthy
     volumes:
       - ./flows:/app/flows:ro
+    # 就绪探针会检查目标系统；liveness 只看进程。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9201/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  runner-browser:
+    profiles: ["browser"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: browser
+      args:
+        PORTER_BUILD: ${PORTER_BUILD:-dev}
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-1.49.1}
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "9201"]
+    environment:
+      <<: *db-env
+      MOCKAPP_URL: http://mockapp:9200
+      USE_BROWSER: "1"
+      HEADLESS: "1"
+      # 生产默认不降级：浏览器起不来明确报 environment，不伪装成业务失败。
+      # 离线演示可临时设成 http。
+      BROWSER_FALLBACK: ${BROWSER_FALLBACK:-off}
+      BROWSER_MAX_SESSIONS: ${BROWSER_MAX_SESSIONS:-1}
+      BROWSER_QUEUE_TIMEOUT: ${BROWSER_QUEUE_TIMEOUT:-60}
+      BROWSER_SESSION_TIMEOUT: ${BROWSER_SESSION_TIMEOUT:-300}
+      BROWSER_SANDBOX: ${BROWSER_SANDBOX:-auto}
+      BROWSER_DEV_SHM: ${BROWSER_DEV_SHM:-auto}
+      BROWSER_ARTIFACTS: ${BROWSER_ARTIFACTS:-off}
+      PORTER_RUNTIME_DIR: /run/porter
+      PORTER_BUILD: ${PORTER_BUILD:-dev}
+    ports: ["9202:9201"]
+    depends_on:
+      db:
+        condition: service_healthy
+      mockapp:
+        condition: service_healthy
+    volumes:
+      - ./flows:/app/flows:ro
+    # 运行数据（profile/产物/槽位文件）放 tmpfs：不出容器、重启即清。
+    # 挂载根用 sticky 1777（tmpfs 的 uid/gid 选项并非所有运行时都支持），
+    # 应用会在其中自建 0700 的 profiles/ 与槽位目录，敏感内容仍在私有目录里。
+    tmpfs:
+      - /run/porter:mode=1777
+      - /tmp:mode=1777
+    read_only: true
+    init: true
+    shm_size: "1gb"
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9201/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      # 首次启动要真实拉起一次 Chromium，给足预热时间。
+      start_period: 60s
 
 volumes:
   pgdata:
