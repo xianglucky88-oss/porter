@@ -1,12 +1,13 @@
 """运行记录持久化。
 
 两张表：
-    runs      每轮一条，只有 started_at / finished_at / status / error。
-              没有步骤级快照。
+    runs      每轮一条：状态、失败语义（failure_kind）与脱敏证据（evidence）。
+              证据记录最终采用的定位规则、候选冲突与页面版本特征，
+              供维护人员事后定位问题，不含业务表单取值。
     submissions  每条录入成功的业务单据，带 source_key 与 receipt_id。
               当前不会写 idempotency_key（因为流程没传）。
 
-连接用 psycopg3。初始化时建表，幂等。
+连接用 psycopg3。初始化时建表，幂等；新增列用 ALTER IF NOT EXISTS 迁移。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from .config import settings
 from .models import Run
@@ -36,6 +38,9 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_flow_idx ON runs (flow, started_at DESC);
 
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS failure_kind TEXT;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS evidence JSONB;
+
 CREATE TABLE IF NOT EXISTS submissions (
     receipt_id   TEXT PRIMARY KEY,
     run_id       TEXT NOT NULL,
@@ -48,13 +53,29 @@ CREATE INDEX IF NOT EXISTS submissions_source_idx ON submissions (source_key);
 """
 
 
+def _serialize_run(row: dict[str, Any]) -> dict[str, Any]:
+    """runs 表行 → API 字典。时间戳转 ISO，evidence 已是 JSON。"""
+    out = dict(row)
+    for key in ("started_at", "finished_at"):
+        v = out.get(key)
+        if isinstance(v, datetime):
+            out[key] = v.isoformat()
+    return out
+
+
+def _scalar(conn: psycopg.Connection[dict[str, Any]], sql: str) -> int:
+    """单值 count 查询；聚合查询必有一行，防御 None 兜底为 0。"""
+    row = conn.execute(sql).fetchone()
+    return int(row["n"]) if row else 0
+
+
 class Store:
     """薄封装。生产环境会换成连接池，这里保持简单。"""
 
     def __init__(self, dsn: str | None = None) -> None:
         self.dsn = dsn or settings.database_url
 
-    def _conn(self) -> psycopg.Connection:
+    def _conn(self) -> psycopg.Connection[dict[str, Any]]:
         return psycopg.connect(self.dsn, row_factory=dict_row)
 
     def wait_ready(self, timeout: float = 60.0) -> None:
@@ -75,15 +96,19 @@ class Store:
             conn.execute(DDL)
 
     def save_run(self, run: Run, source_key: str = "", receipt_id: str | None = None) -> None:
+        evidence = Jsonb(run.evidence) if run.evidence else None
         with self._conn() as conn:
             conn.execute(
-                """INSERT INTO runs (run_id, flow, status, started_at, finished_at, error, attempts)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """INSERT INTO runs (run_id, flow, status, started_at, finished_at, error,
+                                     attempts, failure_kind, evidence)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT (run_id) DO UPDATE
                      SET status = EXCLUDED.status,
                          finished_at = EXCLUDED.finished_at,
                          error = EXCLUDED.error,
-                         attempts = EXCLUDED.attempts""",
+                         attempts = EXCLUDED.attempts,
+                         failure_kind = EXCLUDED.failure_kind,
+                         evidence = EXCLUDED.evidence""",
                 (
                     run.run_id,
                     run.flow,
@@ -92,6 +117,8 @@ class Store:
                     run.finished_at,
                     run.error,
                     run.attempts,
+                    run.failure_kind,
+                    evidence,
                 ),
             )
             if run.status.value == "succeeded" and receipt_id:
@@ -102,6 +129,13 @@ class Store:
                     (receipt_id, run.run_id, run.flow, source_key),
                 )
 
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM runs WHERE run_id = %s", (run_id,)).fetchone()
+        if row is None:
+            return None
+        return _serialize_run(row)
+
     def list_runs(self, limit: int = 20, flow: str | None = None) -> list[dict[str, Any]]:
         q = "SELECT * FROM runs"
         params: list[Any] = []
@@ -111,7 +145,7 @@ class Store:
         q += " ORDER BY started_at DESC LIMIT %s"
         params.append(limit)
         with self._conn() as conn:
-            return list(conn.execute(q, params).fetchall())
+            return [_serialize_run(r) for r in conn.execute(q, params).fetchall()]
 
     def stats(self) -> dict[str, Any]:
         with self._conn() as conn:
@@ -127,12 +161,13 @@ class Store:
                     "SELECT flow, count(*) AS n FROM submissions GROUP BY flow"
                 ).fetchall()
             }
-            dup_sources = conn.execute(
+            dup_sources = _scalar(
+                conn,
                 """SELECT count(*) AS n FROM (
                      SELECT source_key FROM submissions GROUP BY source_key HAVING count(*) > 1
-                   ) t"""
-            ).fetchone()["n"]
-            total = conn.execute("SELECT count(*) AS n FROM submissions").fetchone()["n"]
+                   ) t""",
+            )
+            total = _scalar(conn, "SELECT count(*) AS n FROM submissions")
         return {
             "runs_by_status": by_status,
             "submissions_by_flow": by_flow,

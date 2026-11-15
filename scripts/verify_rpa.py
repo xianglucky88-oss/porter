@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """verify_rpa.py —— RPA 运行时的一致性断言。
 
-核心命题：**重试不应产生重复业务单据**。
+核心命题：**重试不应产生重复业务单据**；**失败必须可归因、证据必须可查**。
 
 检查项：
     V1 对同一批单据执行两次，mockapp 侧的业务单据数应等于 source_key 去重数
     V2 idempotency_key 应在提交时被携带（流程摘要字段）
     V3 每个成功轮次在 runs 表里都有对应记录
-    V4 失败轮次的 error 应能定位到具体步骤
+    V4 失败轮次带 failure_kind，四类失败语义可区分
+    V5 执行证据包含定位规则与页面指纹，且不泄露业务取值
 
 用法:
     python3 scripts/verify_rpa.py --base http://localhost:9201 --mock http://localhost:9200
@@ -86,17 +87,33 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         check(items, "V3/runs-persisted", False, f"无法读取 /runs: {exc}")
 
-    # V4: 失败应带步骤定位
+    # V4: 失败语义可区分——account_opening 缺必填字段，应是 validation_rejected
     bad = next((f for f in flows if f.get("name") == "account_opening"), None)
     if bad:
         rb = post(f"{args.base}/flows/account_opening/run")
-        err = rb.get("error") or ""
+        kind = rb.get("failure_kind") or ""
         check(
             items,
-            "V4/failure-locatable",
-            rb.get("status") == "failed" and ("step" in err or "422" in err or "required" in err.lower()),
-            f"status={rb.get('status')} error={err[:120]!r}",
+            "V4/failure-classified",
+            rb.get("status") == "failed" and kind == "validation_rejected",
+            f"status={rb.get('status')} failure_kind={kind!r} error={(rb.get('error') or '')[:100]!r}",
         )
+
+    # V5: 证据可解释且脱敏——定位规则、页面指纹存在；业务取值不出现
+    ev = r1.get("evidence") or {}
+    page = ev.get("page") or {}
+    steps = ev.get("steps") or []
+    fill_steps = [s for s in steps if s.get("kind") == "fill"]
+    has_strategy = bool(fill_steps) and all(s.get("strategy") for s in fill_steps)
+    blob = json.dumps(ev, ensure_ascii=False)
+    leaked = [s for s in ("李娜", "348600", "INV-20261108-7781") if s in blob]
+    check(
+        items,
+        "V5/evidence",
+        bool(page.get("fingerprint")) and has_strategy and not leaked,
+        f"fingerprint={page.get('fingerprint')!r} 定位步骤={len(fill_steps)} "
+        f"均有策略={has_strategy} 泄露值={leaked or '无'}",
+    )
 
     print("\n== RPA 一致性检查 ==")
     failed = 0

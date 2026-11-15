@@ -7,31 +7,28 @@ steps:
     value: /form/reimbursement
 
   - kind: fill
-    selector: input#source_key
+    field: source_key
     value: EXP-{date}-0042
 
   - kind: fill
-    selector: input#applicant
+    field: applicant
     value: 李娜
 
   - kind: fill
-    selector: input#expense_type
+    field: expense_type
     value: 差旅费
 
   - kind: fill
-    selector: input#amount_cents
+    field: amount_cents
     value: "348600"
 
   - kind: fill
-    selector: input#invoice_no
+    field: invoice_no
     value: INV-20261108-7781
 
   - kind: fill
-    selector: input#remark
+    field: remark
     value: 华东区客户拜访
-
-  - kind: click
-    selector: button#submit-btn
 
   - kind: submit
     value: ""

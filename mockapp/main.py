@@ -5,18 +5,22 @@
   * 表单一页一个，提交后 302 跳转到回执页；
   * 服务端有必填校验；
   * 某些提交会很慢（用于触发客户端超时重试）；
-  * 提交接口支持幂等键，但如果客户端不传，就会真实产生重复单据。
+  * 提交接口支持幂等键，但如果客户端不传，就会真实产生重复单据；
+  * 页面会"改版"：同一表单存在多套布局（字段标签位置、容器层级、
+    控件 id、按钮形态都不同，但业务含义完全一致），可通过
+    /admin/layout 切换，用于验证 RPA 的定位回退能力。
 
 所有随机行为由 seed 与提交序号决定，因此完全可复现。
 
 端点：
-    GET  /form/{form_type}              HTML 表单
+    GET  /form/{form_type}              HTML 表单（按当前布局版本渲染）
     GET  /api/form/{form_type}          表单 schema（JSON）
     POST /api/submit                    JSON 提交
     POST /submit                        HTML 表单提交（浏览器路径）
     GET  /receipt/{submission_id}       回执页
     GET  /admin/records                 所有已受理单据
-    GET  /admin/state                   计数与故障状态
+    GET  /admin/state                   计数与故障状态（含当前布局版本）
+    POST /admin/layout?version=v2       切换页面布局版本
     POST /admin/fault?kind=500&rate=0.2&seed=3
     POST /admin/fault/clear
     POST /admin/reset
@@ -26,14 +30,14 @@
 from __future__ import annotations
 
 import random
-import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 app = FastAPI(title="mockapp", version="2.7.1")
@@ -93,6 +97,7 @@ class State:
         self.seq = 0
         self.fault: dict[str, Any] | None = None
         self.fault_rnd = random.Random(0)
+        self.layout = "v1"
 
     def reset(self) -> None:
         with self.lock:
@@ -101,6 +106,7 @@ class State:
             self.by_source.clear()
             self.seq = 0
             self.fault = None
+            self.layout = "v1"
 
 
 STATE = State()
@@ -132,8 +138,8 @@ def _is_slow(seq: int) -> bool:
     return seq % 7 == 0
 
 
-def _render_form(form_type: str) -> str:
-    spec = FORMS[form_type]
+def _render_v1(spec: dict[str, Any], form_type: str) -> str:
+    """v1 经典布局：<p> 容器，label[for] + input#id，按钮 #submit-btn。"""
     rows = []
     for f in spec["fields"]:
         req = "required" if f["required"] else ""
@@ -153,6 +159,94 @@ def _render_form(form_type: str) -> str:
   <button id="submit-btn" type="submit">提交</button>
 </form>
 </body></html>"""
+
+
+def _render_v2(spec: dict[str, Any], form_type: str) -> str:
+    """v2 改版：div.form-row 容器，label 包裹 input，控件无 id，按钮改名。
+
+    业务含义与 v1 完全一致（字段集合、必填规则、提交语义不变），
+    只是 DOM 结构变了——这正是内部系统前端重构的典型形态。
+    """
+    rows = []
+    for f in spec["fields"]:
+        req = "required" if f["required"] else ""
+        star = "*" if f["required"] else ""
+        rows.append(
+            f'<div class="form-row"><label>{f["label"]}{star}'
+            f'<input name="{f["name"]}" {req}></label></div>'
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>{spec['title']}</title></head>
+<body>
+<main class="page"><h1>{spec['title']}</h1>
+<form id="entry-form" method="post" action="/submit">
+  <input type="hidden" name="form_type" value="{form_type}">
+  <div class="form-row"><label>业务单号<input name="source_key" required></label></div>
+  {' '.join(rows)}
+  <div class="actions"><button id="primary-action" type="submit">提交</button></div>
+</form>
+</main></body></html>"""
+
+
+def _render_v3(spec: dict[str, Any], form_type: str) -> str:
+    """v3 组件化改版：section/grid 布局，label 与控件分离（无 for），
+    id 为组件库自动生成（cmp-N），name 带命名空间（form[xxx]），
+    稳定标识只剩 data-field；提交按钮是 input[type=submit]。
+    """
+    rows = []
+    for i, f in enumerate(spec["fields"]):
+        req = "required" if f["required"] else ""
+        star = "*" if f["required"] else ""
+        rows.append(
+            f'<div class="grid-row"><span class="cell-label">{f["label"]}{star}</span>'
+            f'<span class="cell-control">'
+            f'<input id="cmp-{100 + i}" name="form[{f["name"]}]" data-field="{f["name"]}" {req}>'
+            f"</span></div>"
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>{spec['title']}</title></head>
+<body>
+<section class="panel"><header><h1>{spec['title']}</h1></header>
+<form id="entry-form" method="post" action="/submit">
+  <input type="hidden" name="form_type" value="{form_type}">
+  <div class="grid-row"><span class="cell-label">业务单号</span>
+    <span class="cell-control"><input id="cmp-99" name="form[source_key]" data-field="source_key" required></span></div>
+  {' '.join(rows)}
+  <div class="grid-row"><span class="cell-label"></span>
+    <span class="cell-control"><input type="submit" id="do-submit" value="提交"></span></div>
+</form>
+</section></body></html>"""
+
+
+def _render_ambiguous(spec: dict[str, Any], form_type: str) -> str:
+    """歧义布局：v1 基础上多了一个"批量填充"折叠区块，其中的输入框
+    与主表单的金额字段 id、name 完全重复（前端复制粘贴的典型事故）。
+
+    用于验证定位器遇到多个候选时拒绝猜测、绝不写入相邻/错误字段。
+    """
+    base = _render_v1(spec, form_type)
+    dup = (
+        '<fieldset id="bulk-fill"><legend>批量填充</legend>'
+        '<p><label for="amount_cents">金额（分）</label>'
+        '<input id="amount_cents" name="amount_cents"></p>'
+        "</fieldset>"
+    )
+    return base.replace('<button id="submit-btn"', dup + '<button id="submit-btn"')
+
+
+LAYOUTS = {
+    "v1": _render_v1,
+    "v2": _render_v2,
+    "v3": _render_v3,
+    "ambiguous": _render_ambiguous,
+}
+
+
+def _render_form(form_type: str) -> str:
+    spec = FORMS[form_type]
+    with STATE.lock:
+        layout = STATE.layout
+    return LAYOUTS.get(layout, _render_v1)(spec, form_type)
 
 
 @app.get("/healthz")
@@ -192,26 +286,40 @@ async def api_submit(request: Request) -> JSONResponse:
 
 
 @app.post("/submit")
-async def html_submit(
-    form_type: str = Form(...),
-    source_key: str = Form(...),
-    request: Request = None,  # type: ignore[assignment]
-) -> Any:
-    """HTML 表单提交。字段从 form 里逐个取。"""
+async def html_submit(request: Request) -> Any:
+    """HTML 表单提交。字段从 form 里逐个取。
+
+    浏览器提交的是 application/x-www-form-urlencoded，用标准库解析，
+    不引入 python-multipart 依赖。
+
+    v3 布局的控件 name 带命名空间（form[xxx]），这里做兼容提取——
+    服务端按业务字段名归一化，布局差异不影响受理逻辑。
+    """
     _maybe_fault()
-    form = await request.form()
+    raw = await request.body()
+    parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+    form = {k: v[0] for k, v in parsed.items()}
+
+    def _get(key: str) -> str | None:
+        v = form.get(key)
+        if v is None:
+            v = form.get(f"form[{key}]")
+        return None if v is None else str(v)
+
+    form_type = _get("form_type") or ""
     spec = FORMS.get(form_type)
     if not spec:
         raise HTTPException(status_code=404, detail="unknown form")
+    source_key = _get("source_key") or ""
     fields = {}
     for f in spec["fields"]:
-        v = form.get(f["name"])
+        v = _get(f["name"])
         if v is not None:
-            fields[f["name"]] = str(v)
+            fields[f["name"]] = v
     body = {
         "form_type": form_type,
         "source_key": source_key,
-        "idempotency_key": form.get("idempotency_key"),
+        "idempotency_key": _get("idempotency_key"),
         "fields": fields,
     }
     resp = _accept(body, via_html=True)
@@ -219,7 +327,7 @@ async def html_submit(
 
 
 def _accept(body: dict[str, Any], via_html: bool) -> Any:
-    form_type = body.get("form_type")
+    form_type = str(body.get("form_type") or "")
     spec = FORMS.get(form_type)
     if not spec:
         raise HTTPException(status_code=400, detail=f"unknown form_type {form_type!r}")
@@ -314,7 +422,20 @@ def state() -> dict[str, Any]:
             "duplicates": sum(max(0, n - 1) for n in per_source.values()),
             "per_source": per_source,
             "fault": STATE.fault,
+            "layout": STATE.layout,
         }
+
+
+@app.post("/admin/layout")
+def set_layout(version: str) -> dict[str, Any]:
+    """切换页面布局版本，模拟内部系统改版（业务含义不变）。"""
+    if version not in LAYOUTS:
+        raise HTTPException(
+            status_code=400, detail=f"unknown layout {version!r}; known: {sorted(LAYOUTS)}"
+        )
+    with STATE.lock:
+        STATE.layout = version
+    return {"layout": version}
 
 
 @app.post("/admin/fault")

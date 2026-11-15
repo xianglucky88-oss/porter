@@ -8,19 +8,16 @@ steps:
     value: /form/account_opening
 
   - kind: fill
-    selector: input#source_key
+    field: source_key
     value: ACC-{ts}
 
   - kind: fill
-    selector: input#company_name
+    field: company_name
     value: 杭州岚图供应链有限公司
 
   - kind: fill
-    selector: input#legal_person
+    field: legal_person
     value: 陈默
-
-  - kind: click
-    selector: button#submit-btn
 
   - kind: submit
     value: ""
