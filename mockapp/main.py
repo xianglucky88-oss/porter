@@ -14,10 +14,12 @@
     GET  /api/form/{form_type}          表单 schema（JSON）
     POST /api/submit                    JSON 提交
     POST /submit                        HTML 表单提交（浏览器路径）
+    GET  /api/submissions/lookup        受理记录查询（证据接口，按幂等键或业务单号）
     GET  /receipt/{submission_id}       回执页
     GET  /admin/records                 所有已受理单据
     GET  /admin/state                   计数与故障状态
-    POST /admin/fault?kind=500&rate=0.2&seed=3
+    POST /admin/fault?kind=500&rate=0.2&seed=3    受理前注入 5xx
+    POST /admin/fault?kind=drop&rate=1.0          受理后丢弃响应（回执丢失）
     POST /admin/fault/clear
     POST /admin/reset
     GET  /healthz
@@ -26,7 +28,6 @@
 from __future__ import annotations
 
 import random
-import sqlite3
 import threading
 import time
 import uuid
@@ -107,14 +108,29 @@ STATE = State()
 
 
 def _maybe_fault() -> None:
-    """按配置的概率注入 5xx。"""
+    """受理前故障：按配置的概率注入 5xx（单据未受理）。"""
     f = STATE.fault
-    if not f or f["rate"] <= 0:
+    if not f or f["kind"] != "500" or f["rate"] <= 0:
         return
     with STATE.lock:
         hit = STATE.fault_rnd.random() < f["rate"]
     if hit:
         raise HTTPException(status_code=500, detail="upstream gateway error")
+
+
+def _maybe_drop() -> None:
+    """受理后故障：单据已落库，但响应被丢弃（回执丢失）。
+
+    这是财务集成里最难处理的一类故障：客户端看到 5xx/超时，
+    但服务端其实已经受理。客户端必须靠证据确认，不能盲目重试。
+    """
+    f = STATE.fault
+    if not f or f["kind"] != "drop" or f["rate"] <= 0:
+        return
+    with STATE.lock:
+        hit = STATE.fault_rnd.random() < f["rate"]
+    if hit:
+        raise HTTPException(status_code=500, detail="response lost after accept")
 
 
 def _next_seq() -> int:
@@ -265,6 +281,8 @@ def _accept(body: dict[str, Any], via_html: bool) -> Any:
             STATE.by_idem[idem] = sub
         STATE.by_source.setdefault(source_key, []).append(sub)
 
+    _maybe_drop()
+
     if via_html:
         return RedirectResponse(url=f"/receipt/{sub.submission_id}", status_code=303)
     return JSONResponse(_submission_json(sub), status_code=201)
@@ -278,6 +296,24 @@ def _submission_json(s: Submission) -> dict[str, Any]:
         "idempotency_key": s.idempotency_key,
         "fields": s.fields,
     }
+
+
+@app.get("/api/submissions/lookup")
+def lookup(idempotency_key: str | None = None, source_key: str | None = None) -> dict[str, Any]:
+    """受理记录查询（证据接口）。
+
+    客户端在提交结果未知时用它确认目标系统侧的真实状态，
+    而不是凭本地猜测决定重试或放弃。
+    """
+    if not idempotency_key and not source_key:
+        raise HTTPException(status_code=400, detail="idempotency_key or source_key required")
+    with STATE.lock:
+        subs = list(STATE.submissions)
+    if idempotency_key:
+        matched = [s for s in subs if s.idempotency_key == idempotency_key]
+    else:
+        matched = [s for s in subs if s.source_key == source_key]
+    return {"submissions": [_submission_json(s) for s in matched]}
 
 
 @app.get("/receipt/{submission_id}", response_class=HTMLResponse)
@@ -319,8 +355,8 @@ def state() -> dict[str, Any]:
 
 @app.post("/admin/fault")
 def set_fault(kind: str = "500", rate: float = 0.2, seed: int = 3) -> dict[str, Any]:
-    if kind not in ("500",):
-        raise HTTPException(status_code=400, detail="kind must be 500")
+    if kind not in ("500", "drop"):
+        raise HTTPException(status_code=400, detail="kind must be 500 or drop")
     with STATE.lock:
         STATE.fault = {"kind": kind, "rate": rate, "seed": seed}
         STATE.fault_rnd = random.Random(seed)

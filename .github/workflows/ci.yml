@@ -8,6 +8,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: porter
+          POSTGRES_PASSWORD: porter
+          POSTGRES_DB: porter
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U porter -d porter"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,6 +37,7 @@ jobs:
       - name: pytest
         env:
           MOCKAPP_URL: http://localhost:9200
+          DATABASE_URL: postgresql://porter:porter@localhost:5432/porter
         run: python -m pytest -q
       - name: mockapp logs
         if: always()

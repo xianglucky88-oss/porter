@@ -28,6 +28,16 @@ class Settings:
     step_delay: float = field(default_factory=lambda: float(_env("STEP_DELAY", "0")))
     # 是否使用 Playwright 驱动真实浏览器。0 时走纯 HTTP 驱动（便于 CI）。
     use_browser: bool = field(default_factory=lambda: _env("USE_BROWSER", "0") == "1")
+    # 记录认领租约秒数。租约过期视为持有者已崩溃，允许其他执行者接管。
+    lease_seconds: float = field(default_factory=lambda: float(_env("LEASE_SECONDS", "60")))
+    # 提交后的证据确认宽限期：提交可能仍在途，期内不做"未受理"判定。
+    reconcile_grace_seconds: float = field(
+        default_factory=lambda: float(_env("RECONCILE_GRACE_SECONDS", "30"))
+    )
+    # 证据确认连续失败多少次后转入人工处置。
+    max_reconcile_attempts: int = field(
+        default_factory=lambda: int(_env("MAX_RECONCILE_ATTEMPTS", "5"))
+    )
 
 
 settings = Settings()

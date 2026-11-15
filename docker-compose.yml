@@ -39,6 +39,8 @@ services:
       MOCKAPP_URL: http://mockapp:9200
       USE_BROWSER: "0"
       HEADLESS: "1"
+      # 演示环境缩短证据确认宽限期，生产保持默认 30s
+      RECONCILE_GRACE_SECONDS: "2"
     ports: ["9201:9201"]
     depends_on:
       db:

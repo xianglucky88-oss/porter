@@ -14,7 +14,7 @@ import os
 import httpx
 import pytest
 
-from app.executor import execute, summarize, validate_flow
+from app.executor import execute, validate_flow
 from app.models import Flow, RunStatus
 
 MOCK = os.environ.get("MOCKAPP_URL", "http://localhost:9200")

@@ -1,20 +1,38 @@
 """流程执行引擎。
 
-执行是单向的：从第一步跑到最后一步，任何一步抛错就整轮失败。
-没有断点、没有补偿、没有幂等键。这是这一版最核心的技术债，
+commit point 只有一个：submit 步骤。提交前的 open/fill/select/click/wait/assert
+都是驱动会话内的本地动作，不产生外部副作用，因此崩溃后重放是可证明安全的；
+submit 之后的任何异常都不得改写已确认的提交结果。
+
+单发路径 execute() 与批次路径（app.batch）共享同一个步骤循环
+run_prepared_steps()，区别只在 submit 策略与进度记录。
 """
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Protocol
 
 import httpx
 
 from .config import settings
-from .models import Flow, Run, RunStatus, Step, StepKind, utcnow
+from .models import (
+    Flow,
+    Run,
+    RunStatus,
+    Step,
+    StepKind,
+    SubmitResult,
+    derive_idempotency_key,
+    utcnow,
+)
 from .selectors import field_selector
+
+log = logging.getLogger("porter.executor")
 
 
 class DriverError(RuntimeError):
@@ -26,13 +44,25 @@ class DriverError(RuntimeError):
         self.step = step
 
 
+class SubmitRejected(RuntimeError):
+    """目标系统明确拒绝（4xx）。同样的数据重试无意义，属于终态失败。"""
+
+
+class SubmitTransient(RuntimeError):
+    """提交结果未知（超时/5xx/连接错误）。目标系统可能已受理，必须按未知处理。"""
+
+
 class Driver(Protocol):
     def start(self, flow: Flow) -> None: ...
     def open(self, url: str) -> None: ...
     def fill(self, selector: str, value: str) -> None: ...
     def select(self, selector: str, value: str) -> None: ...
     def click(self, selector: str) -> None: ...
-    def submit(self, idempotency_key: str | None) -> str: ...
+    def source_identity(self) -> str: ...
+    def build_payload(self) -> dict[str, Any]: ...
+    def submit(
+        self, idempotency_key: str | None = None, payload: dict[str, Any] | None = None
+    ) -> SubmitResult: ...
     def wait(self, seconds: float) -> None: ...
     def read_text(self, selector: str) -> str: ...
     def close(self) -> None: ...
@@ -77,22 +107,47 @@ class HttpDriver:
         # 纯 HTTP 驱动把 submit 之前的 click 当成 no-op。
         return None
 
-    def submit(self, idempotency_key: str | None) -> str:
-        payload = {
+    def source_identity(self) -> str:
+        return self.source_key
+
+    def build_payload(self) -> dict[str, Any]:
+        return {
             "form_type": self.form_type,
             "source_key": self.source_key,
-            "fields": self.fields,
+            "fields": dict(self.fields),
         }
-        # 只有流程显式提供幂等键时才带上。
+
+    def submit(
+        self, idempotency_key: str | None = None, payload: dict[str, Any] | None = None
+    ) -> SubmitResult:
+        body = dict(payload) if payload is not None else self.build_payload()
+        # 引擎总是携带幂等键：显式指定的优先，否则由调用方派生好传进来。
         if idempotency_key:
-            payload["idempotency_key"] = idempotency_key
-        resp = self.client.post("/api/submit", json=payload)
-        if resp.status_code == 422:
-            raise ValueError(f"validation failed: {resp.text}")
+            body["idempotency_key"] = idempotency_key
+        try:
+            resp = self.client.post(
+                "/api/submit", json=body, timeout=httpx.Timeout(settings.submit_timeout)
+            )
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            # 请求已发出但响应丢失/超时：目标系统可能已受理。
+            raise SubmitTransient(f"submit outcome unknown: {exc}") from exc
+        if 400 <= resp.status_code < 500:
+            # 4xx 是目标系统的明确拒绝：同样的数据重试不会好转。
+            raise SubmitRejected(f"HTTP {resp.status_code}: {resp.text[:500]}")
+        if resp.status_code >= 500:
+            # 5xx 无法区分"未受理"与"已受理但回执丢失"。
+            raise SubmitTransient(f"submit outcome unknown: HTTP {resp.status_code}")
         resp.raise_for_status()
         data = resp.json()
         self.receipt_id = data["submission_id"]
-        return self.receipt_id
+        replayed = bool(data.get("idempotent_replay")) or (
+            resp.headers.get("X-Idempotent-Replay") == "true"
+        )
+        return SubmitResult(
+            receipt_id=self.receipt_id,
+            replayed=replayed,
+            fields=data.get("fields"),
+        )
 
     def wait(self, seconds: float) -> None:
         time.sleep(seconds)
@@ -133,14 +188,26 @@ class BrowserDriver:
     def click(self, selector: str) -> None:
         self.page.click(selector)
 
-    def submit(self, idempotency_key: str | None) -> str:
+    def source_identity(self) -> str:
+        try:
+            return self.page.input_value("#source_key")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def build_payload(self) -> dict[str, Any]:
+        # 浏览器路径的载荷就是页面表单本身，无法整体取出，仅供接口对齐。
+        return {"form_type": "", "source_key": self.source_identity(), "fields": {}}
+
+    def submit(
+        self, idempotency_key: str | None = None, payload: dict[str, Any] | None = None
+    ) -> SubmitResult:
         # 浏览器路径下，提交就是点按钮 + 等跳转。
         # 浏览器路径不向隐藏域写入 idempotency_key。
         with self.page.expect_navigation(timeout=settings.submit_timeout * 1000):
             self.page.click("#submit-btn")
         # 回执页 URL: /receipt/{id}
         url = self.page.url
-        return url.rsplit("/", 1)[-1]
+        return SubmitResult(receipt_id=url.rsplit("/", 1)[-1], replayed=False, fields=None)
 
     def wait(self, seconds: float) -> None:
         self.page.wait_for_timeout(seconds * 1000)
@@ -176,10 +243,64 @@ def validate_flow(flow: Flow) -> list[str]:
     return problems
 
 
+def prepare_steps(flow: Flow, record: dict[str, Any]) -> list[Step]:
+    """批次执行前的步骤实例化：记录中的同名字段覆盖步骤里的字面量。
+
+    例如记录 {"applicant": "李娜"} 会覆盖 selector 为 input#applicant 的
+    fill 步骤的 value。未覆盖的字段保持流程定义原样（含 {placeholder} 模板，
+    模板在执行时以记录为上下文渲染）。
+    """
+    steps: list[Step] = []
+    for s in flow.steps:
+        if s.kind in (StepKind.FILL, StepKind.SELECT) and s.selector:
+            name = s.selector.split("#", 1)[-1]
+            if name in record:
+                s = replace(s, value=str(record[name]))
+        steps.append(s)
+    return steps
+
+
+#: 步骤事件回调：(序号, 步骤, 阶段[started|done|failed], 详情)
+StepEvent = Callable[[int, Step, str, str], None]
+#: 提交策略：在 submit 步骤被调用，负责幂等键与结果分类。
+SubmitHandler = Callable[[int, Step, Driver, "_ExecContext"], None]
+
+
+def run_prepared_steps(
+    flow_name: str,
+    steps: list[Step],
+    drv: Driver,
+    ctx: _ExecContext,
+    on_step: StepEvent | None = None,
+    submit_handler: SubmitHandler | None = None,
+) -> None:
+    """共享步骤循环。单发与批次两条路径的步骤语义完全一致。"""
+    for idx, step in enumerate(steps):
+        if on_step:
+            on_step(idx, step, "started", "")
+        try:
+            if step.kind == StepKind.SUBMIT and submit_handler is not None:
+                submit_handler(idx, step, drv, ctx)
+            else:
+                _exec_step(idx, step, drv, ctx, flow_name)
+        except StepFailure as exc:
+            if on_step:
+                on_step(idx, step, "failed", str(exc))
+            if step.optional:
+                continue
+            raise DriverError(idx, step, str(exc)) from exc
+        if on_step:
+            on_step(idx, step, "done", "")
+        if settings.step_delay:
+            time.sleep(settings.step_delay)
+
+
 def execute(flow: Flow, driver: Driver | None = None) -> Run:
-    """执行一个流程。
+    """单发执行一个流程（保留给 /flows/{name}/run 与演示）。
 
     返回 Run。异常不外抛，全部收敛进 Run.error —— 调用方（API）只需要看状态。
+    幂等键：步骤未显式指定时，按 (流程名, 业务单号) 派生稳定键，
+    因此同一业务单号重复执行只会被目标系统受理一次。
     """
     run = Run(
         run_id=uuid.uuid4().hex[:16],
@@ -193,15 +314,16 @@ def execute(flow: Flow, driver: Driver | None = None) -> Run:
     try:
         drv.start(flow)
         ctx = _ExecContext()
-        for idx, step in enumerate(flow.steps):
-            try:
-                _exec_step(idx, step, drv, ctx)
-            except StepFailure as exc:
-                if step.optional:
-                    continue
-                raise DriverError(idx, step, str(exc)) from exc
-            if settings.step_delay:
-                time.sleep(settings.step_delay)
+
+        def _submit(idx: int, step: Step, d: Driver, c: _ExecContext) -> None:
+            key = step.idempotency_key or derive_idempotency_key(
+                flow.name, d.source_identity()
+            )
+            result = d.submit(idempotency_key=key)
+            c.receipt_id = result.receipt_id
+            c.submitted = True
+
+        run_prepared_steps(flow.name, flow.steps, drv, ctx, submit_handler=_submit)
         run.status = RunStatus.SUCCEEDED
         run.receipt_id = ctx.receipt_id or None
     except Exception as exc:  # noqa: BLE001 - 全部收敛
@@ -211,8 +333,8 @@ def execute(flow: Flow, driver: Driver | None = None) -> Run:
         if own_driver:
             try:
                 drv.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                log.debug("driver close failed", exc_info=True)
         run.finished_at = utcnow()
     return run
 
@@ -231,10 +353,7 @@ class _ExecContext:
 
 
 def _template(value: str, ctx: _ExecContext) -> str:
-    """极简变量替换：支持 {run_id}、{date} 之类。
-
-    当前只实现了固定几个占位符，没有通用表达式（这是刻意保留的简化）。
-    """
+    """极简变量替换：支持 {run_id}、{date}、{ts} 以及记录字段占位符。"""
     if not value:
         return value
     out = value.replace("{date}", time.strftime("%Y%m%d"))
@@ -244,8 +363,10 @@ def _template(value: str, ctx: _ExecContext) -> str:
     return out
 
 
-def _exec_step(idx: int, step: Step, drv: Driver, ctx: _ExecContext) -> None:
-    """执行单步。出错抛 StepFailure。"""
+def _exec_step(
+    idx: int, step: Step, drv: Driver, ctx: _ExecContext, flow_name: str = ""
+) -> None:
+    """执行单步（非 submit 或默认提交）。出错抛 StepFailure。"""
     try:
         if step.kind == StepKind.OPEN:
             assert step.value or step.selector, "open needs a url in 'value'"
@@ -255,7 +376,7 @@ def _exec_step(idx: int, step: Step, drv: Driver, ctx: _ExecContext) -> None:
             drv.fill(selector, _template(step.value or "", ctx))
         elif step.kind == StepKind.SELECT:
             selector = step.selector or field_selector(step.text or "")
-            drv.select(selector, step.value or "")
+            drv.select(selector, _template(step.value or "", ctx))
         elif step.kind == StepKind.CLICK:
             drv.click(step.selector or "")
         elif step.kind == StepKind.WAIT:
@@ -266,15 +387,17 @@ def _exec_step(idx: int, step: Step, drv: Driver, ctx: _ExecContext) -> None:
             if want and want not in got:
                 raise StepFailure(f"expected {want!r} in {got!r}")
         elif step.kind == StepKind.SUBMIT:
-            # idempotency_key 取自 step 定义。
-            receipt = drv.submit(step.idempotency_key)
-            ctx.receipt_id = receipt
+            key = step.idempotency_key or derive_idempotency_key(
+                flow_name, drv.source_identity()
+            )
+            result = drv.submit(idempotency_key=key)
+            ctx.receipt_id = result.receipt_id
             ctx.submitted = True
         else:  # pragma: no cover - 枚举已穷尽
             raise StepFailure(f"unknown step kind {step.kind}")
     except StepFailure:
         raise
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise StepFailure(str(exc)) from exc
 
 
@@ -285,6 +408,7 @@ def summarize(flow: Flow) -> dict[str, Any]:
         "description": flow.description,
         "dataset": flow.dataset,
         "steps": len(flow.steps),
-        "has_idempotency_key": any(s.idempotency_key for s in flow.steps),
+        # 引擎保证：submit 步骤总是携带幂等键（显式或派生）。
+        "has_idempotency_key": any(s.kind == StepKind.SUBMIT for s in flow.steps),
         "problems": validate_flow(flow),
     }
